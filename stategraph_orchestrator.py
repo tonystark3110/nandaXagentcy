@@ -1,7 +1,7 @@
 """
-StateGraph Orchestrator - OPTIMIZED v4.3
-Skips StopFinder for known station names, only resolves actual landmarks
-Version: 4.3 OPTIMIZED
+StateGraph Orchestrator - v4.4 with Domain Expertise Context Passing
+Skips StopFinder for known station names, passes alerts analysis to planner
+Version: 4.4 - Domain Expert Coordination
 """
 
 import os
@@ -66,10 +66,11 @@ class AgentState(TypedDict):
     resolved_origin: str
     resolved_destination: str
     
-    # Disruption tracking
+    # Disruption tracking - NEW: Store full domain analysis
     has_disruptions: bool
     affected_routes: List[str]
     severity_level: str
+    alerts_domain_analysis: Dict[str, Any]  # NEW: Full analysis from Alerts Agent
     
     final_response: str
     should_end: bool
@@ -123,10 +124,7 @@ def extract_origin_destination(query: str) -> Dict[str, str]:
 
 
 def is_likely_station_name(text: str) -> bool:
-    """
-    Check if text is likely already an MBTA station name.
-    Returns True if it looks like a station, False if it needs resolution.
-    """
+    """Check if text is likely already an MBTA station name"""
     if not text:
         return False
     
@@ -160,14 +158,11 @@ def is_likely_station_name(text: str) -> bool:
         "street", "square", "center", "place", "ave"
     ]
     
-    # Check if it contains station indicators
     if any(indicator in text_lower for indicator in station_indicators):
         logger.info(f"✓ '{text}' looks like a station name (skipping resolution)")
         return True
     
-    # If very short and simple, might be station
     if len(text.split()) <= 2 and len(text) < 20:
-        # Could be station, but not certain
         return False
     
     logger.info(f"✓ '{text}' looks like a landmark (needs resolution)")
@@ -190,6 +185,75 @@ def extract_station_from_stopfinder(text: str) -> str:
         return match.group(1).strip()
     
     return ""
+
+
+def extract_alerts_domain_analysis(alerts_response: str) -> Dict[str, Any]:
+    """
+    Extract domain analysis from Alerts Agent response.
+    
+    FIXED: Only suggests avoiding routes for SEVERE disruptions,
+    not minor scheduled work.
+    """
+    analysis = {
+        "has_analysis": False,
+        "overall_recommendation": "unknown",
+        "affected_routes": [],
+        "severity": "unknown",
+        "should_avoid_routes": [],
+        "delay_impact": "unknown"
+    }
+    
+    if not alerts_response:
+        return analysis
+    
+    # Detect if it's just scheduled maintenance (not severe disruption)
+    is_scheduled = "scheduled" in alerts_response.lower() or "📋" in alerts_response
+    
+    # Extract delay impact for scheduled work
+    impact_match = re.search(r"(\d+)-(\d+)\s*minutes?\s*additional", alerts_response.lower())
+    if impact_match:
+        impact_min = int(impact_match.group(1))
+        impact_max = int(impact_match.group(2))
+        analysis["delay_impact"] = f"{impact_min}-{impact_max} min"
+        
+        # Only avoid if impact is severe (>20 min)
+        if impact_max > 20:
+            analysis["severity"] = "major"
+        else:
+            analysis["severity"] = "minor"
+    
+    # Extract affected routes
+    for line in ["Red Line", "Orange Line", "Blue Line", "Green Line"]:
+        if line in alerts_response:
+            analysis["affected_routes"].append(line.split()[0])  # Just "Red", "Orange", etc.
+    
+    # CRITICAL FIX: Only avoid routes for SEVERE disruptions
+    # Scheduled work with <20 min impact = don't avoid, just note
+    if is_scheduled:
+        if analysis["severity"] == "minor":
+            # Minor scheduled work - don't avoid route
+            analysis["should_avoid_routes"] = []
+            analysis["overall_recommendation"] = "allow_extra_time"
+            logger.info(f"✓ Scheduled work with minor impact - route still usable")
+        else:
+            # Major scheduled work - might avoid
+            analysis["should_avoid_routes"] = analysis["affected_routes"]
+            analysis["overall_recommendation"] = "consider_alternative"
+            logger.info(f"✓ Major scheduled work - consider alternatives")
+    else:
+        # Active incident - check severity
+        if "🔴" in alerts_response or "critical" in alerts_response.lower():
+            analysis["severity"] = "critical"
+            analysis["should_avoid_routes"] = analysis["affected_routes"]
+            analysis["overall_recommendation"] = "take_alternative"
+        elif "🟠" in alerts_response or "major" in alerts_response.lower():
+            analysis["severity"] = "major"
+            analysis["should_avoid_routes"] = analysis["affected_routes"]
+            analysis["overall_recommendation"] = "take_alternative"
+    
+    logger.info(f"✓ Context: severity={analysis['severity']}, avoid={analysis['should_avoid_routes']}, impact={analysis['delay_impact']}")
+    
+    return analysis
 
 
 # ============================================================================
@@ -247,22 +311,27 @@ async def semantic_discovery(query: str) -> List[AgentConfig]:
     descriptions = [f"• {a['agent_id']}: {a['description']}" for a in catalog]
     catalog_text = "\n".join(descriptions)
     
-    prompt = f"""Match query to agents.
+    prompt = f"""Match query to the most relevant agents based on what the user actually needs.
 
 Query: "{query}"
 
-Agents:
+Available Agents:
 {catalog_text}
 
-Match ONLY the agents actually needed:
+MATCHING RULES:
+1. If query is ONLY about alerts/delays/disruptions (no routing) → ONLY alerts agent
+   Examples: "Red Line delays?", "Should I wait?", "How long will delays last?", "Why delays?"
 
-- For ALERTS queries ("show alerts", "any delays"): ONLY mbta-alerts
-- For STOP queries ("find station", "where is"): ONLY mbta-stopfinder  
-- For TRIP PLANNING ("route from X to Y", "get me to"): ALL THREE (stopfinder, alerts, planner)
+2. If query asks for route/directions with origin and destination → stopfinder + alerts + planner
+   Examples: "Route from Park to Harvard", "Get from X to Y", "How do I get to Harvard?"
 
-Do NOT include agents unless they are actually needed for the query.
+3. If query asks about stops/stations (no routing) → ONLY stopfinder agent
+   Examples: "Find Harvard station", "Stops on Red Line"
 
-Return JSON: {{"matched_agents": ["id1", "id2"]}}
+DO NOT match planner agent for queries that don't have explicit routing intent (from X to Y).
+DO NOT match planner for queries asking about delay duration, wait times, or disruption analysis.
+
+Return JSON with ONLY the agents truly needed: {{"matched_agents": ["id1", "id2"]}}
 """
     
     try:
@@ -418,6 +487,7 @@ async def discovery_node(state: AgentState) -> AgentState:
             "has_disruptions": False,
             "affected_routes": [],
             "severity_level": "none",
+            "alerts_domain_analysis": {},  # NEW
             "routing_decision": ""
         }
 
@@ -457,7 +527,10 @@ def routing_node(state: AgentState) -> AgentState:
 
 async def execute_agents_node(state: AgentState) -> AgentState:
     """
-    OPTIMIZED: Only calls StopFinder for actual landmarks, not known stations
+    OPTIMIZED v4.4: 
+    - Only calls StopFinder for actual landmarks
+    - Extracts domain analysis from Alerts Agent
+    - Passes alerts context to Planner Agent
     """
     with tracer.start_as_current_span("execute_agents"):
         matched = state.get("matched_agents", [])
@@ -508,7 +581,6 @@ async def execute_agents_node(state: AgentState) -> AgentState:
                 
                 logger.info(f"📍 Resolving landmarks with StopFinder...")
                 
-                # Resolve origin (only if it's NOT a station)
                 if origin and not origin_is_station:
                     logger.info(f"   Resolving origin landmark: '{origin}'")
                     resolved_origin = await call_stopfinder_for_location(origin, sf_config, state["conversation_id"])
@@ -516,7 +588,6 @@ async def execute_agents_node(state: AgentState) -> AgentState:
                     logger.info(f"   Skipping origin (already station): '{origin}'")
                     resolved_origin = origin
                 
-                # Resolve destination (only if it's NOT a station)
                 if destination and not dest_is_station:
                     logger.info(f"   Resolving destination landmark: '{destination}'")
                     resolved_destination = await call_stopfinder_for_location(destination, sf_config, state["conversation_id"])
@@ -524,25 +595,24 @@ async def execute_agents_node(state: AgentState) -> AgentState:
                     logger.info(f"   Skipping destination (already station): '{destination}'")
                     resolved_destination = destination
                 
-                # Use resolved names or fall back to original text
                 final_origin = resolved_origin if resolved_origin else origin
                 final_destination = resolved_destination if resolved_destination else destination
                 
                 logger.info(f"✓ Final stations: '{final_origin}' → '{final_destination}'")
                 
-                # Only add StopFinder to agents_called if we actually called it
                 if (origin and not origin_is_station) or (destination and not dest_is_station):
                     agents_called.append(stopfinder_id)
         else:
-            # Both are stations, use as-is
             resolved_origin = origin
             resolved_destination = destination
             logger.info(f"✓ Both are stations, using as-is: '{origin}' → '{destination}'")
         
         # STEP 2: Execute remaining agents (Alerts and Planner)
+        # NEW: Track full domain analysis from Alerts Agent
         has_disruptions = False
         affected = []
         severity = "none"
+        alerts_analysis = {}
         
         for idx, agent_id in enumerate(matched):
             # Skip StopFinder (already handled)
@@ -564,31 +634,69 @@ async def execute_agents_node(state: AgentState) -> AgentState:
             
             # Construct query
             if agent_id == "mbta-alerts":
-                agent_query = "Check for major service disruptions on Red Line and Green Line"
-                logger.info(f"⚠️ Alerts: '{agent_query}'")
+                agent_query = state["user_message"]  # Pass full query for context
+                logger.info(f"⚠️ Alerts Agent")
             
             elif agent_id in ["mbta-planner", "mbta-route-planner"]:
-                # Planner: Use RESOLVED station names
+                # Planner: Use RESOLVED station names + alerts context
                 from_station = resolved_origin if resolved_origin else origin
                 to_station = resolved_destination if resolved_destination else destination
                 
+                # Check if user EXPLICITLY wants multiple route options
+                user_msg_lower = state["user_message"].lower()
+                wants_multiple = any(word in user_msg_lower for word in [
+                    "two route", "multiple route", "give me two", "give me multiple",
+                    "show me options", "give me options", "different routes",
+                    "compare routes"
+                ])
+                # NOTE: Removed "alternative", "route option", "considering" 
+                # These don't mean user wants multiple options shown
+                
                 if from_station and to_station:
-                    agent_query = f"""IMPORTANT: Plan route using these EXACT station names. Do NOT extract different stations.
+                    if wants_multiple:
+                        agent_query = f"""IMPORTANT: Plan route using these EXACT station names.
 
-Origin station (use exactly): {from_station}
-Destination station (use exactly): {to_station}
+Origin: {from_station}
+Destination: {to_station}
 
-Plan the route between these two stations."""
+Provide TWO or MORE different route options. For each:
+- Transfer stations
+- Lines used
+- Estimated time
+- Number of stops
+
+Rank by reliability if disruptions exist, or by speed if no disruptions."""
+                    else:
+                        agent_query = f"""IMPORTANT: Plan route using these EXACT station names.
+
+Origin: {from_station}
+Destination: {to_station}
+
+Plan the route between these stations."""
                 elif to_station:
                     agent_query = f"Find routes to {to_station}"
                 else:
                     agent_query = state["user_message"]
                 
-                # Add disruption context
-                if has_disruptions:
-                    agent_query += f"\n\nIMPORTANT: {', '.join(affected)} have {severity} disruptions. Recommend alternatives."
+                # NEW: Add alerts domain analysis context if available
+                if alerts_analysis:
+                    logger.info(f"🧠 Passing alerts analysis to Planner:")
+                    logger.info(f"   Recommendation: {alerts_analysis.get('overall_recommendation')}")
+                    logger.info(f"   Severity: {alerts_analysis.get('severity')}")
+                    logger.info(f"   Avoid routes: {alerts_analysis.get('should_avoid_routes')}")
+                    
+                    agent_query += f"\n\nALERTS ANALYSIS CONTEXT:"
+                    agent_query += f"\n- Overall recommendation: {alerts_analysis.get('overall_recommendation', 'unknown')}"
+                    agent_query += f"\n- Severity: {alerts_analysis.get('severity', 'unknown')}"
+                    
+                    if alerts_analysis.get('should_avoid_routes'):
+                        agent_query += f"\n- AVOID these routes: {', '.join(alerts_analysis['should_avoid_routes'])}"
+                        agent_query += f"\n- Find alternative routes that don't use these lines"
+                    
+                    if alerts_analysis.get('overall_recommendation') == 'take_alternative':
+                        agent_query += f"\n- CRITICAL: Major disruptions detected, prioritize alternative routes"
                 
-                logger.info(f"🗺️ Planner: from='{from_station}' to='{to_station}'")
+                logger.info(f"🗺️ Planner with context")
             
             else:
                 agent_query = state["user_message"]
@@ -607,8 +715,12 @@ Plan the route between these two stations."""
                     
                     resp_text = result.get("response", "")
                     
-                    # Extract disruption context
+                    # NEW: Extract domain analysis from Alerts Agent
                     if agent_id == "mbta-alerts":
+                        # Extract domain expertise insights
+                        alerts_analysis = extract_alerts_domain_analysis(resp_text)
+                        
+                        # Also extract simple disruption markers
                         if "🔴" in resp_text or "🟠" in resp_text:
                             has_disruptions = True
                             
@@ -621,7 +733,7 @@ Plan the route between these two stations."""
                             elif "🟠" in resp_text:
                                 severity = "major"
                             
-                            logger.info(f"⚠️ MAJOR disruptions: {affected}, severity={severity}")
+                            logger.info(f"⚠️ Disruptions: {affected}, severity={severity}")
                         else:
                             logger.info(f"✓ No major disruptions")
                     
@@ -642,6 +754,7 @@ Plan the route between these two stations."""
             "has_disruptions": has_disruptions,
             "affected_routes": affected,
             "severity_level": severity,
+            "alerts_domain_analysis": alerts_analysis,  # NEW: Pass analysis forward
             "messages": [
                 AIMessage(content=f"{r.get('agent_used', 'agent')}: {r.get('response', '')[:100]}", 
                          name=r.get('agent_used', 'agent'))
@@ -664,52 +777,78 @@ async def synthesize_node(state: AgentState) -> AgentState:
         if not responses:
             return {**state, "final_response": "Agents unavailable.", "should_end": True}
         
+        # Get agent types that were called
+        agents_called_list = state.get("agents_called", [])
         routing = state.get("routing_decision", "")
         
-        # Intelligent synthesis for trip planning
-        if routing == "FULL_CHAIN" and len(responses) >= 2:
-            agents_called_list = state.get("agents_called", [])
-            
-            # Find alerts and planner responses
+        # ================================================================
+        # FIX: For simple routing queries, return planner response directly
+        # Don't over-synthesize and lose route details
+        # ================================================================
+        
+        # If ONLY planner was called (simple routing query)
+        if len(agents_called_list) == 1 and "planner" in agents_called_list[0]:
+            logger.info("📍 Simple routing - returning planner response directly")
+            return {**state, "final_response": responses[0], "should_end": True}
+        
+        # If ONLY alerts was called (simple alert query)
+        if len(agents_called_list) == 1 and "alert" in agents_called_list[0]:
+            logger.info("⚠️ Simple alerts - returning alerts response directly")
+            return {**state, "final_response": responses[0], "should_end": True}
+        
+        # If alerts + planner (both called)
+        if len(agents_called_list) == 2 and any("alert" in a for a in agents_called_list) and any("planner" in a for a in agents_called_list):
+            # Find each response
             alerts = ""
             planner = ""
             
             for idx, agent_id in enumerate(agents_called_list):
                 if idx < len(responses):
-                    resp_text = responses[idx].get("response", "") if isinstance(responses[idx], dict) else ""
+                    resp = responses[idx]
+                    resp_text = resp.get("response", "") if isinstance(resp, dict) else resp
                     
                     if "alert" in agent_id.lower():
                         alerts = resp_text
                     elif "planner" in agent_id.lower():
                         planner = resp_text
             
-            origin_text = state.get("origin_text", "")
-            dest_text = state.get("destination_text", "")
-            resolved_origin = state.get("resolved_origin", "")
-            resolved_dest = state.get("resolved_destination", "")
-            disruptions = state.get("has_disruptions", False)
-            affected = state.get("affected_routes", [])
+            # Check if alerts said "no disruptions" or similar
+            alerts_lower = alerts.lower()
+            has_real_disruptions = any(word in alerts_lower for word in ["delay", "disruption", "problem", "issue", "scheduled"])
             
-            prompt = f"""Synthesize MBTA trip response (3-4 sentences max):
+            if not has_real_disruptions or "no" in alerts_lower[:100]:
+                # No real disruptions - just return planner response
+                logger.info("✓ No major disruptions - returning planner route directly")
+                return {**state, "final_response": planner, "should_end": True}
+            
+            # Has disruptions - combine both responses simply
+            combined = f"{alerts}\n\n{planner}"
+            logger.info("✓ Combined alerts + planner responses")
+            return {**state, "final_response": combined, "should_end": True}
+        
+        # FULL_CHAIN (stopfinder + alerts + planner) - needs synthesis
+        if routing == "FULL_CHAIN" and len(responses) >= 2:
+            alerts = ""
+            planner = ""
+            
+            for idx, agent_id in enumerate(agents_called_list):
+                if idx < len(responses):
+                    resp = responses[idx]
+                    resp_text = resp.get("response", "") if isinstance(resp, dict) else resp
+                    
+                    if "alert" in agent_id.lower():
+                        alerts = resp_text
+                    elif "planner" in agent_id.lower():
+                        planner = resp_text
+            
+            # For full chain, do minimal synthesis
+            prompt = f"""Combine alerts and route info concisely (2-3 sentences):
 
-User query: {origin_text} → {dest_text}
-Resolved stations: {resolved_origin or origin_text} → {resolved_dest or dest_text}
+Alerts: {alerts[:200]}
+Route: {planner[:400]}
 
-Alerts status:
-{alerts[:250]}
-
-Route plan:
-{planner[:300]}
-
-CRITICAL RULES:
-1. Use ONLY information from the Route plan above - do NOT invent stations or routes
-2. If landmarks were resolved, mention it briefly
-3. State ONLY major disruptions (🔴 🟠), skip minor
-4. Repeat the route directions from the planner EXACTLY
-5. Max 4 sentences, be concise
-
-Example: "Park Street to Harvard is a direct Red Line route. No major disruptions. From Park Street, take the Red Line towards Alewife to Harvard (3 stops, ~8 minutes)."
-"""
+Just state: any key alerts briefly, then the actual route instructions.
+Don't lose the route details."""
             
             try:
                 async with httpx.AsyncClient() as client:
@@ -723,7 +862,7 @@ Example: "Park Street to Harvard is a direct Red Line route. No major disruption
                             "model": "gpt-4o-mini",
                             "messages": [{"role": "user", "content": prompt}],
                             "temperature": 0.2,
-                            "max_tokens": 200
+                            "max_tokens": 300
                         },
                         timeout=15
                     )
@@ -735,9 +874,11 @@ Example: "Park Street to Harvard is a direct Red Line route. No major disruption
                 
             except Exception as e:
                 logger.error(f"Synthesis error: {e}")
+                # Fallback: just combine responses
                 return {**state, "final_response": "\n\n".join(responses), "should_end": True}
         
         else:
+            # Default: return agent outputs directly
             return {**state, "final_response": "\n\n".join(responses), "should_end": True}
 
 
@@ -788,18 +929,21 @@ def build_graph() -> StateGraph:
 
 class StateGraphOrchestrator:
     """
-    Optimized Production Orchestrator v4.3
-    - Skips StopFinder for known station names
-    - Only resolves actual landmarks
-    - Faster responses for station-to-station queries
+    Production Orchestrator v4.4 - Domain Expertise Coordination
+    - Skips StopFinder for known stations
+    - Extracts domain analysis from Alerts Agent
+    - Passes alerts context to Planner Agent
+    - Enables collaborative domain expertise
     """
     
     def __init__(self):
         global _current_orchestrator
         
         logger.info("=" * 80)
-        logger.info("🚀 StateGraph Orchestrator v4.3 OPTIMIZED")
+        logger.info("🚀 StateGraph Orchestrator v4.4 - Domain Expert Coordination")
         logger.info("   ✅ Smart StopFinder skipping")
+        logger.info("   ✅ Domain analysis extraction")
+        logger.info("   ✅ Context passing between agents")
         logger.info("   ✅ Registry discovery")
         logger.info("   ✅ SLIM transport")
         logger.info("=" * 80)
@@ -817,7 +961,7 @@ class StateGraphOrchestrator:
                 self.use_slim = False
         
         _current_orchestrator = self
-        logger.info("✅ Orchestrator v4.3 ready")
+        logger.info("✅ Orchestrator v4.4 ready")
     
     async def startup_validation(self):
         """Validate registry connection"""
@@ -839,8 +983,8 @@ class StateGraphOrchestrator:
         logger.info("✅ Startup complete")
     
     async def process_message(self, user_message: str, conversation_id: str) -> Dict[str, Any]:
-        """Process message through optimized intelligent flow"""
-        with tracer.start_as_current_span("stategraph_v43"):
+        """Process message through domain expertise coordination"""
+        with tracer.start_as_current_span("stategraph_v44"):
             initial = {
                 "user_message": user_message,
                 "conversation_id": conversation_id,
@@ -859,6 +1003,7 @@ class StateGraphOrchestrator:
                 "has_disruptions": False,
                 "affected_routes": [],
                 "severity_level": "none",
+                "alerts_domain_analysis": {},  # NEW
                 "final_response": "",
                 "should_end": False,
                 "routing_decision": ""
@@ -878,6 +1023,10 @@ class StateGraphOrchestrator:
                     "transport": "slim" if self.use_slim else "http",
                     "optimization": {
                         "stopfinder_skipped": not final.get("resolved_origin") and not final.get("resolved_destination"),
+                    },
+                    "domain_expertise": {
+                        "alerts_analysis_available": bool(final.get("alerts_domain_analysis")),
+                        "context_passed_to_planner": bool(final.get("alerts_domain_analysis"))
                     },
                     "context": {
                         "origin": final.get("origin_text", ""),
