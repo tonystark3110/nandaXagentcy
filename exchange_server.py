@@ -281,7 +281,7 @@ def needs_domain_expertise(query: str) -> tuple[bool, str, List[str]]:
     """
     Detect if query needs domain expertise beyond API data.
     
-    Simple keyword-based detection - fast and transparent.
+    UPDATED v5.1: Added crowding detection
     
     Returns:
         (needs_expertise: bool, reasoning: str, detected_patterns: List[str])
@@ -289,6 +289,16 @@ def needs_domain_expertise(query: str) -> tuple[bool, str, List[str]]:
     
     query_lower = query.lower()
     detected_patterns = []
+    
+    # CROWDING keywords (NEW in v5.1!)
+    CROWDING = [
+        "crowded", "crowd", "busy", "full", "packed", "space",
+        "capacity", "occupancy", "how full", "standing room",
+        "seats available", "room on"
+    ]
+    if any(kw in query_lower for kw in CROWDING):
+        detected_patterns.append("crowding_analysis")
+        return True, "Query requires crowding analysis with domain expertise", detected_patterns
     
     # PREDICTIVE keywords
     PREDICTIVE = ["should i wait", "worth waiting", "how long will", "when will"]
@@ -321,7 +331,6 @@ def needs_domain_expertise(query: str) -> tuple[bool, str, List[str]]:
     
     # DEFAULT: Simple fact lookup
     return False, "Simple fact lookup - MCP can handle", detected_patterns
-
 
 # ============================================================================
 # UNIFIED CLASSIFICATION + ROUTING + TOOL SELECTION (WITH SHORTCUT PATH)
@@ -405,22 +414,71 @@ async def classify_route_and_select_tool(query: str, available_tools: List[Dict]
 ═══════════════════════════════════════════════════════════
 STEP 1: CLASSIFY INTENT
 ═══════════════════════════════════════════════════════════
-- "alerts": Service alerts, delays, disruptions
-- "stops": Stop/station information
-- "trip_planning": Route planning, directions
-- "general": Off topic, non MBTA queries
+
+CRITICAL: Understand what counts as MBTA-related!
+
+**"alerts"** - Anything about MBTA service, delays, or disruptions (CURRENT OR HISTORICAL):
+  ✅ Current status: "Red Line delays?", "Any issues now?", "Current service disruptions?"
+  ✅ Historical patterns: "How long do medical delays take?", "Typical delay duration?", "Usually how long?"
+  ✅ Pattern questions: "Based on past data...", "On average...", "Generally how long...", "Typically..."
+  ✅ Crowding: "How crowded?", "Is it busy?", "Room on trains?", "Packed?", "Full trains?"
+  ✅ Predictions: "Should I wait?", "Worth waiting?", "How long will this last?", "When will it clear?"
+  ✅ Analysis: "How serious?", "Why delays?", "What's causing this?"
+  
+  PRINCIPLE: If asking about MBTA delays, duration, crowding, patterns, or service status → "alerts"
+  
+**"stops"** - Station/stop information, finding stations:
+  ✅ "Where is Copley?", "Find Harvard station", "Stops on Green Line"
+  ✅ "What station is nearest to X?", "List all stations", "Show me Orange Line stops"
+  
+**"trip_planning"** - Route planning, directions, how to get somewhere:
+  ✅ "Route from X to Y", "How do I get to X?", "Best route to Y?"
+  ✅ "Park St to Harvard?", "Get me from X to Y", "Directions to MIT?"
+  
+**"general"** - NOT about MBTA/transit at all (completely off-topic):
+  ❌ "What's the weather in Boston?" - Not transit
+  ❌ "Who won the Red Sox game?" - Not transit (even though it says "Red")
+  ❌ "Boston history facts?" - Not transit
+  ❌ "What's 2+2?" - Not transit
+  ❌ "Tell me a joke" - Not transit
+
+PRINCIPLE: If query mentions MBTA, trains, T, subway, delays, crowding, stations, routes, or ANY transit topic → NOT "general"!
+
+Only classify as "general" if the query has NOTHING to do with Boston public transit.
 
 ═══════════════════════════════════════════════════════════
 STEP 2: CHOOSE PATH & SELECT TOOL
 ═══════════════════════════════════════════════════════════
 
-**MCP Path (Fast, ~400ms):**
-- Best for: Single API call, simple fact lookup
-- Examples: "Red Line delays?", "Next train at Park St?"
+**Decision Tree:**
 
-**A2A Path (Multi Agent, ~1500ms):**
-- Best for: Trip planning, multi-step reasoning
-- Examples: "Park St to Harvard?", "Best route if delays?"
+Is it MBTA-related?
+  ├─ NO → path="a2a", intent="general"
+  └─ YES → Does it need analysis/prediction/historical data/expertise?
+            ├─ YES → path="a2a" (Domain experts needed)
+            │         Examples: "How long do delays take?", "Should I wait?", "How crowded?", "Route from X to Y"
+            └─ NO → Can MCP tool provide the answer?
+                      ├─ YES → path="mcp" + select tool
+                      │         Examples: "Red Line delays RIGHT NOW?", "Next train at Park?"
+                      └─ NO → path="a2a"
+
+**MCP Path (Fast, ~400ms):**
+- Best for: Current real-time data lookup with single API call
+- Examples: "Red Line delays right now?", "Next train at Park St?", "Where are Orange Line trains?"
+- NO analysis, NO historical, NO predictions - just current facts
+
+**A2A Path (Domain Experts, ~1500ms):**
+- Best for: Requires analysis, expertise, historical data, predictions, or multi-agent coordination
+- Examples:
+  * "How long do delays usually take?" → Needs historical data from domain expert
+  * "Should I wait?" → Needs decision support analysis
+  * "How crowded is it?" → Needs crowding analysis
+  * "Route from X to Y" → Needs multi-agent coordination
+  * "Best route considering delays?" → Needs expert reasoning
+
+PRINCIPLE: 
+- Current fact → MCP
+- Analysis/Prediction/Historical/Expertise → A2A
 
 ═══════════════════════════════════════════════════════════
 STEP 3: SELECT MCP TOOL (ONLY IF path="mcp")
@@ -429,21 +487,32 @@ STEP 3: SELECT MCP TOOL (ONLY IF path="mcp")
 Available MCP Tools:
 {tools_list}
 
-**PARAMETER NAMING:**
-- Use "route_id" NOT "route"
-- Red Line = "Red", Orange = "Orange", Blue = "Blue"
+**PARAMETER NAMING (CRITICAL):**
+- Use "route_id" NOT "route" (e.g., route_id="Red")
+- Use "stop_id" NOT "stop"
+- Red Line = "Red", Orange = "Orange", Blue = "Blue", Green = "Green-B"
 
 ═══════════════════════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════
 
-Return ONLY valid JSON:
+Return ONLY valid JSON (no markdown, no code blocks):
 
+**For A2A path:**
+{{
+  "intent": "alerts",
+  "confidence": 0.95,
+  "path": "a2a",
+  "reasoning": "Historical MBTA delay pattern question requires domain expertise with historical data",
+  "complexity": 0.6
+}}
+
+**For MCP path:**
 {{
   "intent": "alerts",
   "confidence": 0.95,
   "path": "mcp",
-  "reasoning": "Simple alert query - direct API call",
+  "reasoning": "Current alert lookup can be answered with direct API call",
   "complexity": 0.2,
   "mcp_tool": "mbta_get_alerts",
   "mcp_parameters": {{"route_id": "Red"}}
