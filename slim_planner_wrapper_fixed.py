@@ -454,7 +454,7 @@ Response:"""
     # ========================================================================
     
     async def find_stop_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Find stop by name with fuzzy matching"""
+        """Find stop by name with fuzzy matching - FIXED: strips punctuation"""
         if not name:
             return None
         
@@ -465,18 +465,20 @@ Response:"""
                 "filter[location_type]": "1"
             }
             
-            logger.info(f"Searching stop: '{name}'")
+            # CRITICAL FIX: Strip punctuation before searching
+            name_clean = name.strip("?.,!;:\"'").lower().strip()
+            
+            logger.info(f"Searching stop: '{name}' (cleaned: '{name_clean}')")
             
             async with httpx.AsyncClient() as client:
                 response = await client.get(f"{MBTA_BASE_URL}/stops", params=params, timeout=10)
                 response.raise_for_status()
             
             stops = response.json().get("data", [])
-            name_lower = name.lower().strip()
             
             for stop in stops:
                 stop_name = stop.get("attributes", {}).get("name", "").lower()
-                if name_lower in stop_name:
+                if name_clean in stop_name or stop_name in name_clean:
                     attributes = stop.get("attributes", {})
                     result = {
                         "id": stop.get("id"),
@@ -488,7 +490,7 @@ Response:"""
                     logger.info(f"Found: {result['name']}")
                     return result
             
-            logger.warning(f"No stop matching '{name}'")
+            logger.warning(f"No stop matching '{name_clean}'")
             return None
         
         except Exception as e:
