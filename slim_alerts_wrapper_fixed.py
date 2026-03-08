@@ -533,6 +533,26 @@ class AlertsExecutor(AgentExecutor):
                 return v
         return None
     
+    def extract_all_routes_from_query(self, query: str) -> List[str]:
+        """
+        Extract ALL routes mentioned in query (for comparison queries).
+        
+        NEW: Handles "Which is less crowded, Red or Orange?"
+        """
+        q = query.lower()
+        routes = []
+        
+        mapping = {
+            "red": "Red", "orange": "Orange",
+            "blue": "Blue", "green": "Green-B"
+        }
+        
+        for keyword, route_id in mapping.items():
+            if keyword in q:
+                routes.append(route_id)
+        
+        return routes
+    
     def is_accessibility_alert(self, alert: Dict) -> bool:
         """Filter out elevator/escalator alerts"""
         attrs = alert.get("attributes", {})
@@ -618,19 +638,48 @@ class AlertsExecutor(AgentExecutor):
             # Mode 1: Crowding question
             # ================================================================
             if self.is_crowding_question(message_text):
-                route = self.extract_route(message_text)
+                # Check if comparing multiple lines
+                all_routes = self.extract_all_routes_from_query(message_text)
                 
-                if not route:
-                    response_text = "Which line would you like crowding info for? (Red, Orange, Blue, or Green)"
-                else:
-                    logger.info(f"🚇 Crowding query: {route}")
-                    stop_id = await self.extract_stop_id_from_query(message_text)
+                if len(all_routes) > 1:
+                    # Comparison query - check all routes
+                    logger.info(f"🚇 Crowding comparison: {all_routes}")
                     
+                    comparisons = []
+                    for route in all_routes:
+                        crowding = await self.get_crowding_estimate(route, None)
+                        comparisons.append({
+                            "route": route,
+                            "level": crowding['level'],
+                            "score": crowding['average_occupancy']
+                        })
+                    
+                    # Build comparison response
+                    response_text = "🚇 **Line Crowding Comparison:**\n\n"
+                    
+                    # Sort by crowding (least to most)
+                    comparisons.sort(key=lambda x: x['score'])
+                    
+                    for comp in comparisons:
+                        emoji = "🟢" if comp['score'] < 30 else "🟡" if comp['score'] < 60 else "🔴"
+                        response_text += f"{emoji} **{comp['route']} Line:** {comp['level'].upper()} ({comp['score']:.0f}%)\n"
+                    
+                    response_text += f"\n💡 **Recommendation:** {comparisons[0]['route']} Line is least crowded right now.\n\n"
+                    response_text += "ℹ️ *Data from MBTA real-time vehicle occupancy sensors (updated every 10-30 seconds)*"
+                
+                elif all_routes:
+                    # Single route
+                    route = all_routes[0]
+                    logger.info(f"🚇 Crowding query: {route}")
+                    
+                    stop_id = await self.extract_stop_id_from_query(message_text)
                     if stop_id:
                         logger.info(f"   At stop: {stop_id}")
                     
                     crowding = await self.get_crowding_estimate(route, stop_id)
                     response_text = self.format_crowding_response(crowding)
+                else:
+                    response_text = "Which line would you like crowding info for? (Red, Orange, Blue, or Green)"
                 
                 response_message = Message(
                     message_id=str(uuid4()),
