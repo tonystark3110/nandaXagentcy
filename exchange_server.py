@@ -1,178 +1,21 @@
-# src/exchange_agent/exchange_server.py
+# src/frontend/chat_server.py
 
-"""
-Exchange Agent - Hybrid A2A + MCP Orchestrator
-Version 4.0 - Intelligent Expertise-Based Routing
-
-Routes queries based on domain expertise needs:
-- Simple fact lookups → MCP (fast API wrappers)
-- Queries needing predictions/analysis/recommendations → A2A (domain experts)
-"""
-
-import sys
-import os
-
-# Load environment variables FIRST (before any other imports)
-from dotenv import load_dotenv
-load_dotenv()  # This loads .env from current directory or parent directories
-
-# Initialize OpenTelemetry BEFORE other imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
-try:
-    from src.observability.otel_config import setup_otel
-    from src.observability.clickhouse_logger import get_clickhouse_logger
-    setup_otel("exchange-agent")
-    print("✅ OpenTelemetry configured for exchange-agent")
-except Exception as e:
-    print(f"⚠️  Could not setup observability: {e}")
-    import traceback
-    traceback.print_exc()
-    print("Continuing without telemetry...")
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-import logging
-import time
-import uuid
+from typing import List, Dict
+import httpx
 import json
-import asyncio
-import random
-import re
+import logging
+from datetime import datetime
+from pathlib import Path
 
-# Add parent directory to Python path for imports
-if __name__ == "__main__":
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
-# Try relative imports first, fall back to absolute
-try:
-    from .mcp_client import MCPClient
-    from .stategraph_orchestrator import StateGraphOrchestrator  
-except ImportError:
-    from mcp_client import MCPClient
-    from stategraph_orchestrator import StateGraphOrchestrator  
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-# Verify API key is loaded
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    logger.error("=" * 60)
-    logger.error("❌ OPENAI_API_KEY not found in environment!")
-    logger.error("=" * 60)
-    logger.error("Please ensure .env file exists in project root with:")
-    logger.error("  OPENAI_API_KEY=sk-...")
-    logger.error("=" * 60)
-    sys.exit(1)
-else:
-    logger.info(f"✓ OpenAI API key loaded (ends with: ...{api_key[-4:]})")
+app = FastAPI(title="MBTA Chat UI")
 
-# Initialize OpenAI client
-from openai import OpenAI
-openai_client = OpenAI(api_key=api_key)
-
-# Global instances
-mcp_client: Optional[MCPClient] = None
-stategraph_orchestrator: Optional[StateGraphOrchestrator] = None
-clickhouse_logger = None
-
-# Tracer for OpenTelemetry
-try:
-    from opentelemetry import trace
-    tracer = trace.get_tracer(__name__)
-    logger.info("✅ OpenTelemetry tracer initialized")
-except ImportError:
-    # Fallback no-op tracer
-    class NoOpTracer:
-        def start_as_current_span(self, name):
-            from contextlib import contextmanager
-            @contextmanager
-            def _span():
-                yield type('obj', (object,), {'set_attribute': lambda *args: None, 'set_status': lambda *args: None, 'record_exception': lambda *args: None})()
-            return _span()
-    tracer = NoOpTracer()
-    logger.warning("⚠️  OpenTelemetry not available, using no-op tracer")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Manage application lifecycle
-    Startup: Initialize MCP client, StateGraph orchestrator, and ClickHouse logger
-    Shutdown: Cleanup resources
-    """
-    global mcp_client, stategraph_orchestrator, clickhouse_logger
-    
-    # Startup
-    logger.info("=" * 60)
-    logger.info("Starting Exchange Agent v4.0 - Intelligent Expertise Router")
-    logger.info("=" * 60)
-    
-    # Initialize ClickHouse Logger
-    try:
-        clickhouse_logger = get_clickhouse_logger()
-        logger.info("✅ ClickHouse logger initialized")
-    except Exception as e:
-        logger.warning(f"⚠️  ClickHouse logger initialization failed: {e}")
-        clickhouse_logger = None
-    
-    # Initialize StateGraph Orchestrator (for A2A path)
-    try:
-        stategraph_orchestrator = StateGraphOrchestrator()
-        logger.info("✅ StateGraph Orchestrator initialized")
-        
-        # Validate registry connectivity and agent discovery
-        logger.info("🔍 Validating registry connectivity...")
-        await stategraph_orchestrator.startup_validation()
-        logger.info("✅ Registry validation passed - A2A path ready")
-        
-    except RuntimeError as e:
-        logger.error(f"❌ Registry validation failed: {e}")
-        logger.error("A2A path unavailable - agents not discoverable")
-        stategraph_orchestrator = None
-    except Exception as e:
-        logger.error(f"❌ StateGraph Orchestrator initialization failed: {e}")
-        logger.exception(e)
-        stategraph_orchestrator = None
-    
-    # Initialize MCP Client (for fast path)
-    try:
-        mcp_client = MCPClient()
-        await mcp_client.initialize()
-        logger.info("✅ MCP Client initialized - Fast path available")
-    except Exception as e:
-        logger.warning(f"⚠️  MCP Client initialization failed: {e}")
-        logger.warning("Falling back to A2A agents only")
-        mcp_client = None
-    
-    logger.info("=" * 60)
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down Exchange Agent...")
-    if mcp_client:
-        await mcp_client.cleanup()
-    logger.info("✓ Shutdown complete")
-
-
-# Create FastAPI app with lifespan
-app = FastAPI(
-    title="MBTA Exchange Agent",
-    description="Hybrid A2A + MCP with LLM-Based Intelligent Routing",
-    version="5.0.0",
-    lifespan=lifespan
-)
-
-# Add CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -181,788 +24,1034 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================================
-# AUTO-INSTRUMENTATION - Automatically trace HTTP requests/responses
-# ============================================================================
-try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+# Configuration
+EXCHANGE_AGENT_URL = "http://localhost:8100"
+
+# Mount static files for images
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+class ConnectionManager:
+    """Manages WebSocket connections"""
     
-    # Auto-instrument FastAPI (all endpoints)
-    FastAPIInstrumentor.instrument_app(app)
-    logger.info("✅ FastAPI auto-instrumentation enabled")
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
     
-    # Auto-instrument HTTPX (HTTP client for A2A calls)
-    HTTPXClientInstrumentor().instrument()
-    logger.info("✅ HTTPX auto-instrumentation enabled")
-except Exception as e:
-    logger.warning(f"⚠️  Auto-instrumentation failed: {e}")
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"New WebSocket connection. Total: {len(self.active_connections)}")
+    
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        logger.info(f"WebSocket disconnected. Total: {len(self.active_connections)}")
+    
+    async def send_message(self, message: Dict, websocket: WebSocket):
+        await websocket.send_json(message)
 
-
-# Request/Response models
-class ChatRequest(BaseModel):
-    query: str
-    user_id: Optional[str] = "default_user"
-    conversation_id: Optional[str] = None
-
-
-class ChatResponse(BaseModel):
-    response: str
-    path: str  # Now supports: "mcp", "a2a", or "shortcut"
-    latency_ms: int
-    intent: str
-    confidence: float
-    metadata: Optional[Dict[str, Any]] = None
-
+manager = ConnectionManager()
 
 @app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "service": "MBTA Exchange Agent",
-        "version": "5.0.0",
-        "architecture": "Hybrid A2A + MCP with LLM-Based Intelligent Routing",
-        "routing_logic": "GPT-4o-mini semantic classification (replaces keyword matching)",
-        "features": ["llm_routing", "domain_analysis", "multi_agent_orchestration"],
-        "optimization": "Semantic understanding of query intent",
-        "mcp_available": mcp_client is not None and mcp_client._initialized,
-        "stategraph_available": stategraph_orchestrator is not None,
-        "clickhouse_available": clickhouse_logger is not None,
-        "status": "healthy"
-    }
-
-
-# ============================================================
-# STEP 0: SHORTCUT PATH DETECTION (NO LLM CALL)
-# ============================================================
-
-def is_greeting_or_simple_query(query: str) -> bool:
-    """Fast pattern matching to detect greetings and simple queries"""
-    query_lower = query.lower().strip()
-    
-    # Very short queries only (less than 10 words)
-    word_count = len(query_lower.split())
-    if word_count > 10:
-        return False
-    
-    # Only match pure greetings
-    greeting_patterns = [
-        'hi', 'hello', 'hey', 'greetings', 'good morning',
-        'good afternoon', 'good evening', 'howdy', 'sup', 'yo'
-    ]
-    
-    if any(query_lower == greeting or query_lower.startswith(greeting + " ") 
-           for greeting in greeting_patterns):
-        return True
-    
-    return False
-
-
-def get_shortcut_response(query: str) -> str:
-    """Generate response for shortcut path queries (NO LLM NEEDED)"""
-    query_lower = query.lower().strip()
-    
-    greeting_keywords = ['hi', 'hello', 'hey', 'greetings']
-    if any(keyword in query_lower for keyword in greeting_keywords):
-        responses = [
-            "Hello! I'm MBTA Agentcy. Ask about service alerts, routes, or stations!",
-            "Hi! I can help with Boston MBTA transit info.",
-        ]
-        return random.choice(responses)
-    
-    return "I'm specialized in Boston MBTA transit..."
-
-
-# ============================================================
-# NEW: INTELLIGENT EXPERTISE-BASED ROUTING
-# ============================================================
-
-def needs_domain_expertise(query: str) -> tuple[bool, str, List[str]]:
-    """
-    Detect if query needs domain expertise beyond API data.
-    
-    Simple keyword-based detection - fast and transparent.
-    
-    Returns:
-        (needs_expertise: bool, reasoning: str, detected_patterns: List[str])
-    """
-    
-    query_lower = query.lower()
-    detected_patterns = []
-    
-    # PREDICTIVE keywords
-    PREDICTIVE = ["should i wait", "worth waiting", "how long will", "when will"]
-    if any(kw in query_lower for kw in PREDICTIVE):
-        detected_patterns.append("predictive")
-        return True, "Query requires predictive analysis", detected_patterns
-    
-    # DECISION SUPPORT keywords
-    DECISION = ["should i", "recommend", "suggest", "better to", "what should i do"]
-    if any(kw in query_lower for kw in DECISION):
-        detected_patterns.append("decision_support")
-        return True, "Query needs decision support", detected_patterns
-    
-    # CONDITIONAL keywords
-    CONDITIONAL = ["if there are", "considering", "depending on"]
-    if any(kw in query_lower for kw in CONDITIONAL):
-        detected_patterns.append("conditional")
-        return True, "Query has conditional logic", detected_patterns
-    
-    # ANALYTICAL keywords
-    ANALYTICAL = ["why", "explain", "what caused", "how serious"]
-    if any(kw in query_lower for kw in ANALYTICAL):
-        detected_patterns.append("analytical")
-        return True, "Query needs analytical interpretation", detected_patterns
-    
-    # ROUTING pattern
-    if re.search(r"from .+ to .+", query_lower):
-        detected_patterns.append("routing")
-        return True, "Query requires multi-agent coordination", detected_patterns
-    
-    # DEFAULT: Simple fact lookup
-    return False, "Simple fact lookup - MCP can handle", detected_patterns
-
-
-# ============================================================================
-# UNIFIED CLASSIFICATION + ROUTING + TOOL SELECTION (WITH SHORTCUT PATH)
-# ============================================================================
-
-async def classify_route_and_select_tool(query: str, available_tools: List[Dict]) -> Dict:
-    """
-    OPTIMIZED ROUTING with early shortcut detection:
-    
-    STEP 0: Check for shortcut path (greetings, simple queries)
-            -> If matched, return immediately (no LLM call needed)
-    
-    STEP 1-3: Single LLM call for complex queries:
-        1. Intent classification
-        2. Path selection (MCP vs A2A)
-        3. Tool selection with parameters (if MCP chosen)
-    
-    Returns:
-        {
-            "path": "shortcut|mcp|a2a",
-            "intent": "greeting|alerts|stops|trip_planning|general",
-            "confidence": 0.95,
-            "reasoning": "Explanation of decision",
-            "complexity": 0.0,
-            
-            # Only if path="shortcut":
-            "shortcut_response": "Hello! I'm MBTA Agentcy...",
-            "llm_calls": 0,
-            
-            # Only if path="mcp":
-            "mcp_tool": "mbta_get_alerts",
-            "mcp_parameters": {"route_id": "Red"}
+async def get_ui():
+    """Serve the enhanced chat UI with real-time weather effects and protocol override"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MBTA Agentcy - Transit Intelligence</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-    """
-    
-    with tracer.start_as_current_span("classify_route_and_select_tool") as span:
-        span.set_attribute("query", query)
-        span.set_attribute("query_length", len(query))
-        span.set_attribute("available_tools_count", len(available_tools))
-        
-        # ================================================================
-        # STEP 0: SHORTCUT PATH DETECTION (NO LLM CALL)
-        # ================================================================
-        if is_greeting_or_simple_query(query):
-            with tracer.start_as_current_span("shortcut_path_detection") as shortcut_span:
-                shortcut_span.set_attribute("matched", True)
-                
-                shortcut_response = get_shortcut_response(query)
-                
-                decision = {
-                    "path": "shortcut",
-                    "intent": "greeting",
-                    "confidence": 1.0,
-                    "reasoning": "Simple greeting detected via pattern matching",
-                    "complexity": 0.0,
-                    "shortcut_response": shortcut_response,
-                    "llm_calls": 0
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Weather Canvas */
+        #weatherCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1400px;
+            height: 90vh;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            overflow: hidden;
+            position: relative;
+            z-index: 2;
+        }
+
+        /* Left Panel - Chat */
+        .chat-panel {
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #e0e0e0;
+        }
+
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 30px;
+            font-size: 24px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .weather-indicator {
+            font-size: 28px;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+
+        .connection-status {
+            font-size: 12px;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.2);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ff4444;
+        }
+
+        .status-dot.connected {
+            background: #00ff88;
+        }
+
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px 30px;
+            background: #f8f9fa;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            text-align: right;
+        }
+
+        .message-content {
+            display: inline-block;
+            max-width: 70%;
+            padding: 12px 18px;
+            border-radius: 18px;
+            word-wrap: break-word;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant .message-content {
+            background: white;
+            color: #333;
+            border: 1px solid #e0e0e0;
+            border-bottom-left-radius: 4px;
+            text-align: left;
+        }
+
+        .message.system {
+            text-align: center;
+        }
+
+        .message.system .message-content {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+            font-size: 13px;
+            padding: 8px 14px;
+        }
+
+        /* Protocol Override Controls */
+        .protocol-controls {
+            padding: 15px 30px;
+            background: #f0f0f0;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .protocol-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #555;
+        }
+
+        .protocol-button {
+            padding: 8px 16px;
+            border: 2px solid #ddd;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .protocol-button:hover {
+            background: #f8f9fa;
+            border-color: #667eea;
+        }
+
+        .protocol-button.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-color: #667eea;
+        }
+
+        .protocol-button.active:hover {
+            background: linear-gradient(135deg, #5568d3 0%, #653a8b 100%);
+        }
+
+        .protocol-icon {
+            font-size: 14px;
+        }
+
+        /* Input Area */
+        .input-area {
+            padding: 20px 30px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .input-container {
+            display: flex;
+            gap: 10px;
+        }
+
+        #messageInput {
+            flex: 1;
+            padding: 14px 18px;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        #messageInput:focus {
+            border-color: #667eea;
+        }
+
+        #sendButton {
+            padding: 14px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        #sendButton:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        #sendButton:active {
+            transform: translateY(0);
+        }
+
+        #sendButton:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Right Panel - System Internals */
+        .internals-panel {
+            background: #1a1a2e;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .internals-header {
+            padding: 20px;
+            background: #16213e;
+            border-bottom: 1px solid #2a2a4e;
+        }
+
+        .internals-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+
+        .internals-subtitle {
+            font-size: 12px;
+            color: #888;
+        }
+
+        .weather-info {
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: rgba(78, 205, 196, 0.1);
+            border-left: 3px solid #4ecdc4;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .weather-info-title {
+            font-weight: 600;
+            color: #4ecdc4;
+            margin-bottom: 4px;
+        }
+
+        .weather-info-detail {
+            color: #aaa;
+            font-size: 11px;
+        }
+
+        .internals-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .info-block {
+            background: #16213e;
+            border: 1px solid #2a2a4e;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .info-label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .info-value {
+            font-size: 14px;
+            color: #fff;
+            font-weight: 500;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 6px;
+            margin-bottom: 6px;
+        }
+
+        .badge.mcp {
+            background: #4ecdc4;
+            color: #1a1a2e;
+        }
+
+        .badge.a2a {
+            background: #ff6b6b;
+            color: white;
+        }
+
+        .badge.shortcut {
+            background: #95e1d3;
+            color: #1a1a2e;
+        }
+
+        .badge.fallback {
+            background: #ffa07a;
+            color: #1a1a2e;
+        }
+
+        .badge.override {
+            background: #ffd93d;
+            color: #1a1a2e;
+            animation: pulseBadge 1.5s infinite;
+        }
+
+        @keyframes pulseBadge {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .latency-bar {
+            height: 6px;
+            background: #2a2a4e;
+            border-radius: 3px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+
+        .latency-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4ecdc4, #667eea);
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+
+        .agent-list {
+            list-style: none;
+        }
+
+        .agent-item {
+            padding: 8px 0;
+            border-bottom: 1px solid #2a2a4e;
+            font-size: 13px;
+        }
+
+        .agent-item:last-child {
+            border-bottom: none;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+
+        .internals-panel ::-webkit-scrollbar-track {
+            background: #1a1a2e;
+        }
+
+        .internals-panel ::-webkit-scrollbar-thumb {
+            background: #4ecdc4;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="weatherCanvas"></canvas>
+
+    <div class="container">
+        <!-- Left Panel: Chat -->
+        <div class="chat-panel">
+            <div class="chat-header">
+                <div class="header-left">
+                    <span>🚇 MBTA Agentcy</span>
+                    <span class="weather-indicator" id="weatherIcon">☁️</span>
+                </div>
+                <div class="connection-status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">Connecting...</span>
+                </div>
+            </div>
+
+            <div class="messages-container" id="messagesContainer">
+                <div class="message system">
+                    <div class="message-content">
+                        Welcome to MBTA Agentcy! Ask about transit alerts, routes, or stations.
+                    </div>
+                </div>
+            </div>
+
+            <div class="protocol-controls">
+                <span class="protocol-label">Routing Mode:</span>
+                <button class="protocol-button active" data-protocol="auto" onclick="selectProtocol('auto')">
+                    <span class="protocol-icon">🤖</span>
+                    <span>Auto</span>
+                </button>
+                <button class="protocol-button" data-protocol="mcp" onclick="selectProtocol('mcp')">
+                    <span class="protocol-icon">⚡</span>
+                    <span>MCP</span>
+                </button>
+                <button class="protocol-button" data-protocol="a2a" onclick="selectProtocol('a2a')">
+                    <span class="protocol-icon">🔄</span>
+                    <span>A2A</span>
+                </button>
+            </div>
+
+            <div class="input-area">
+                <div class="input-container">
+                    <input 
+                        type="text" 
+                        id="messageInput" 
+                        placeholder="Ask about MBTA alerts, routes, or stations..."
+                        onkeypress="handleKeyPress(event)"
+                    >
+                    <button id="sendButton" onclick="sendMessage()">Send</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Panel: System Internals -->
+        <div class="internals-panel">
+            <div class="internals-header">
+                <div class="internals-title">System Internals</div>
+                <div class="internals-subtitle">Real-time routing & execution metrics</div>
+                <div class="weather-info" id="weatherInfo">
+                    <div class="weather-info-title">Loading weather...</div>
+                    <div class="weather-info-detail">Fetching Boston conditions...</div>
+                </div>
+            </div>
+
+            <div class="internals-content" id="internalsContent">
+                <div class="info-block">
+                    <div class="info-label">Waiting for query...</div>
+                    <div class="info-value" style="color: #888;">Send a message to see routing details</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let currentProtocol = 'auto';
+        let currentWeather = null;
+
+        // ============================================================
+        // WEATHER EFFECTS SYSTEM
+        // ============================================================
+
+        const canvas = document.getElementById('weatherCanvas');
+        const ctx = canvas.getContext('2d');
+
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        window.addEventListener('resize', () => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        });
+
+        let particles = [];
+
+        class Particle {
+            constructor(type) {
+                this.type = type;
+                this.x = Math.random() * canvas.width;
+                this.y = Math.random() * canvas.height - canvas.height;
+                this.reset();
+            }
+
+            reset() {
+                if (this.type === 'snow') {
+                    this.speed = Math.random() * 1 + 0.5;
+                    this.radius = Math.random() * 3 + 1;
+                    this.wind = Math.random() * 0.5 - 0.25;
+                    this.opacity = Math.random() * 0.6 + 0.4;
+                } else if (this.type === 'rain') {
+                    this.speed = Math.random() * 5 + 10;
+                    this.length = Math.random() * 20 + 10;
+                    this.opacity = Math.random() * 0.4 + 0.3;
+                    this.wind = Math.random() * 2 - 1;
+                } else if (this.type === 'cloud') {
+                    this.speed = Math.random() * 0.3 + 0.1;
+                    this.radius = Math.random() * 30 + 20;
+                    this.opacity = Math.random() * 0.3 + 0.2;
+                    this.y = Math.random() * canvas.height * 0.3;
                 }
-                
-                span.set_attribute("routing.path", "shortcut")
-                span.set_attribute("llm.calls", 0)
-                
-                logger.info(f"⚡ SHORTCUT PATH: {decision['reasoning']}")
-                
-                return decision
-        
-        # ================================================================
-        # NOT A SHORTCUT - Proceed with full LLM routing
-        # ================================================================
-        
-        # Format available tools for the LLM
-        tools_list = "\n".join([
-            f"  • {tool['name']}: {tool['description']}"
-            for tool in available_tools
-        ]) if available_tools else "  (No MCP tools available - must use A2A)"
-        
-        system_prompt = f"""You are an intelligent MBTA query routing system.
-
-**YOUR TASK:** Analyze the query and make ALL routing decisions in one response.
-
-═══════════════════════════════════════════════════════════
-STEP 1: CLASSIFY INTENT
-═══════════════════════════════════════════════════════════
-- "alerts": Service alerts, delays, disruptions
-- "stops": Stop/station information
-- "trip_planning": Route planning, directions
-- "general": Off topic, non MBTA queries
-
-═══════════════════════════════════════════════════════════
-STEP 2: CHOOSE PATH & SELECT TOOL
-═══════════════════════════════════════════════════════════
-
-**MCP Path (Fast, ~400ms):**
-- Best for: Single API call, simple fact lookup
-- Examples: "Red Line delays?", "Next train at Park St?"
-
-**A2A Path (Multi Agent, ~1500ms):**
-- Best for: Trip planning, multi-step reasoning
-- Examples: "Park St to Harvard?", "Best route if delays?"
-
-═══════════════════════════════════════════════════════════
-STEP 3: SELECT MCP TOOL (ONLY IF path="mcp")
-═══════════════════════════════════════════════════════════
-
-Available MCP Tools:
-{tools_list}
-
-**PARAMETER NAMING:**
-- Use "route_id" NOT "route"
-- Red Line = "Red", Orange = "Orange", Blue = "Blue"
-
-═══════════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════════
-
-Return ONLY valid JSON:
-
-{{
-  "intent": "alerts",
-  "confidence": 0.95,
-  "path": "mcp",
-  "reasoning": "Simple alert query - direct API call",
-  "complexity": 0.2,
-  "mcp_tool": "mbta_get_alerts",
-  "mcp_parameters": {{"route_id": "Red"}}
-}}"""
-
-        user_message = f"""Query: "{query}"
-
-Analyze and provide routing decision."""
-
-        try:
-            with tracer.start_as_current_span("llm_unified_routing") as llm_span:
-                llm_span.set_attribute("model", "gpt-4o-mini")
-                
-                response = await asyncio.to_thread(
-                    openai_client.chat.completions.create,
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.3,
-                    max_tokens=300
-                )
-                
-                decision_text = response.choices[0].message.content.strip()
-                
-                # Remove markdown formatting
-                if decision_text.startswith("```json"):
-                    decision_text = decision_text.replace("```json", "").replace("```", "").strip()
-                elif decision_text.startswith("```"):
-                    decision_text = decision_text.replace("```", "").strip()
-                
-                decision = json.loads(decision_text)
-                
-                # Validate and set defaults
-                decision.setdefault("complexity", 0.5)
-                decision.setdefault("confidence", 0.5)
-                decision.setdefault("reasoning", "No reasoning provided")
-                decision["llm_calls"] = 1
-                
-                # Validate MCP path
-                if decision["path"] == "mcp":
-                    if "mcp_tool" not in decision:
-                        logger.warning("MCP selected but no tool - fallback to A2A")
-                        decision["path"] = "a2a"
-                    elif "mcp_parameters" not in decision:
-                        decision["mcp_parameters"] = {}
-                
-                span.set_attribute("intent", decision['intent'])
-                span.set_attribute("confidence", decision['confidence'])
-                span.set_attribute("path", decision['path'])
-                
-                logger.info(f"🧠 LLM Decision:")
-                logger.info(f"   Intent: {decision['intent']} ({decision['confidence']:.2f})")
-                logger.info(f"   Path: {decision['path']} (complexity: {decision['complexity']:.2f})")
-                logger.info(f"   Reasoning: {decision['reasoning']}")
-                
-                return decision
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {e}")
-            return {
-                "intent": "general",
-                "confidence": 0.3,
-                "path": "a2a",
-                "reasoning": f"JSON error: {str(e)}",
-                "complexity": 0.5,
-                "llm_calls": 1
-            }
-        except Exception as e:
-            logger.error(f"Routing failed: {e}", exc_info=True)
-            return {
-                "intent": "general",
-                "confidence": 0.3,
-                "path": "a2a",
-                "reasoning": f"Error: {str(e)}",
-                "complexity": 0.5,
-                "llm_calls": 1
             }
 
+            update() {
+                if (this.type === 'snow') {
+                    this.y += this.speed;
+                    this.x += this.wind;
 
-# ============================================================================
-# MAIN CHAT ENDPOINT
-# ============================================================================
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """
-    Main chat endpoint with intelligent expertise-based routing
-    
-    THREE PATHS:
-    1. SHORTCUT (~10ms) - Greetings (pattern matching)
-    2. MCP (~400ms) - Simple fact lookups
-    3. A2A (~1500ms) - Queries needing domain expertise
-    """
-    
-    with tracer.start_as_current_span("chat_endpoint") as root_span:
-        start_time = time.time()
-        query = request.query
-        conversation_id = request.conversation_id or str(uuid.uuid4())
-        
-        root_span.set_attribute("query", query)
-        root_span.set_attribute("conversation_id", conversation_id)
-        root_span.set_attribute("user_id", request.user_id)
-        
-        if not query or not query.strip():
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-        logger.info("=" * 80)
-        logger.info(f"📨 Received query: {query}")
-        logger.info(f"   Conversation ID: {conversation_id}")
-        
-        # Get available MCP tools
-        available_tools = []
-        if mcp_client and mcp_client._initialized:
-            if hasattr(mcp_client, '_available_tools') and mcp_client._available_tools:
-                for tool in mcp_client._available_tools:
-                    available_tools.append({
-                        "name": tool.name,
-                        "description": tool.description or ""
-                    })
-                logger.info(f"📋 {len(available_tools)} MCP tools available")
-        
-        # ====================================================================
-        # STEP 1: INTELLIGENT EXPERTISE-BASED ROUTING (NEW in v4.0)
-        # ====================================================================
-        
-        with tracer.start_as_current_span("expertise_based_routing") as routing_span:
-            # Analyze if query needs domain expertise (keyword-based)
-            needs_expertise, expertise_reasoning, detected_patterns = needs_domain_expertise(query)
-            
-            routing_span.set_attribute("needs_expertise", needs_expertise)
-            routing_span.set_attribute("reasoning", expertise_reasoning)
-            routing_span.set_attribute("detected_patterns", str(detected_patterns))
-            
-            logger.info(f"🧠 EXPERTISE ANALYSIS:")
-            logger.info(f"   Needs expertise: {needs_expertise}")
-            logger.info(f"   Reasoning: {expertise_reasoning}")
-            logger.info(f"   Patterns detected: {detected_patterns}")
-            
-            # Still use unified LLM for intent classification and tool selection
-            decision = await classify_route_and_select_tool(query, available_tools)
-            
-            # OVERRIDE path based on expertise analysis
-            if needs_expertise:
-                original_path = decision["path"]
-                decision["path"] = "a2a"
-                decision["reasoning"] = f"EXPERTISE REQUIRED: {expertise_reasoning}"
-                
-                if original_path != "a2a":
-                    logger.info(f"   ✓ OVERRIDE: {original_path} → a2a (expertise needed)")
-                else:
-                    logger.info(f"   ✓ Confirmed A2A (expertise needed)")
-            else:
-                # No expertise needed - MCP is fine if available
-                if decision["path"] == "mcp":
-                    logger.info(f"   ✓ Confirmed MCP - {expertise_reasoning}")
-                else:
-                    logger.info(f"   ✓ A2A path (LLM decision, no override)")
-            
-            intent = decision["intent"]
-            confidence = decision["confidence"]
-            chosen_path = decision["path"]
-        
-        # Log to ClickHouse: User message
-        if clickhouse_logger:
-            try:
-                clickhouse_logger.log_conversation(
-                    conversation_id=conversation_id,
-                    user_id=request.user_id,
-                    role="user",
-                    content=query,
-                    intent=intent,
-                    routed_to_orchestrator=(chosen_path == "a2a"),
-                    metadata={
-                        "confidence": confidence,
-                        "complexity": decision.get('complexity', 0.5),
-                        "reasoning": decision['reasoning'],
-                        "path": chosen_path,
-                        "needs_expertise": needs_expertise,
-                        "expertise_reasoning": expertise_reasoning,
-                        "detected_patterns": detected_patterns
+                    if (this.y > canvas.height) {
+                        this.y = -10;
+                        this.x = Math.random() * canvas.width;
                     }
-                )
-            except Exception as e:
-                logger.warning(f"ClickHouse logging failed: {e}")
-        
-        # ====================================================================
-        # STEP 2: EXECUTE CHOSEN PATH
-        # ====================================================================
-        
-        response_text = ""
-        path_taken = ""
-        metadata = {
-            "unified_decision": {
-                "intent": intent,
-                "confidence": confidence,
-                "path": chosen_path,
-                "reasoning": decision["reasoning"],
-                "complexity": decision.get("complexity", 0.5),
-                "llm_calls": decision.get("llm_calls", 0)
-            },
-            "expertise_analysis": {
-                "needs_expertise": needs_expertise,
-                "reasoning": expertise_reasoning,
-                "detected_patterns": detected_patterns
+                } else if (this.type === 'rain') {
+                    this.y += this.speed;
+                    this.x += this.wind;
+
+                    if (this.y > canvas.height) {
+                        this.y = -this.length;
+                        this.x = Math.random() * canvas.width;
+                    }
+                } else if (this.type === 'cloud') {
+                    this.x += this.speed;
+
+                    if (this.x > canvas.width + this.radius) {
+                        this.x = -this.radius;
+                    }
+                }
+            }
+
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = this.opacity;
+
+                if (this.type === 'snow') {
+                    ctx.fillStyle = 'white';
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                    ctx.fill();
+                } else if (this.type === 'rain') {
+                    ctx.strokeStyle = '#a0c4ff';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(this.x, this.y);
+                    ctx.lineTo(this.x + this.wind * 2, this.y + this.length);
+                    ctx.stroke();
+                } else if (this.type === 'cloud') {
+                    ctx.fillStyle = 'white';
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                    ctx.arc(this.x + this.radius * 0.5, this.y - this.radius * 0.3, this.radius * 0.7, 0, Math.PI * 2);
+                    ctx.arc(this.x + this.radius, this.y, this.radius * 0.8, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                ctx.restore();
             }
         }
-        
-        if chosen_path == "shortcut":
-            # SHORTCUT PATH
-            with tracer.start_as_current_span("handle_shortcut_path"):
-                response_text = decision["shortcut_response"]
-                path_taken = "shortcut"
-                
-                metadata["shortcut_execution"] = {
-                    "method": "pattern_matching",
-                    "llm_calls": 0,
-                    "cost_usd": 0.0
+
+        function setWeatherEffect(weatherCondition) {
+            particles = [];
+            
+            const weatherMap = {
+                'Clear': 'clear',
+                'Clouds': 'cloudy',
+                'Rain': 'rain',
+                'Drizzle': 'rain',
+                'Thunderstorm': 'rain',
+                'Snow': 'snow',
+                'Mist': 'cloudy',
+                'Fog': 'cloudy',
+                'Haze': 'cloudy'
+            };
+
+            const effect = weatherMap[weatherCondition] || 'clear';
+
+            if (effect === 'snow') {
+                for (let i = 0; i < 150; i++) {
+                    particles.push(new Particle('snow'));
                 }
-                
-                logger.info(f"⚡ SHORTCUT PATH executed")
-        
-        elif chosen_path == "mcp" and mcp_client and mcp_client._initialized:
-            # MCP FAST PATH
-            tool_name = decision['mcp_tool']
-            tool_params = decision['mcp_parameters']
-            
-            logger.info(f"🚀 MCP Fast Path:")
-            logger.info(f"   Tool: {tool_name}")
-            logger.info(f"   Parameters: {tool_params}")
-            
-            try:
-                tool_result = await call_mcp_tool_dynamic(tool_name, tool_params)
-                
-                metadata["mcp_execution"] = {
-                    "tool": tool_name,
-                    "parameters": tool_params,
-                    "success": True
+            } else if (effect === 'rain') {
+                for (let i = 0; i < 200; i++) {
+                    particles.push(new Particle('rain'));
                 }
-                
-                response_text = await synthesize_mcp_response_with_llm(query, tool_name, tool_result)
-                
-                path_taken = "mcp"
-                logger.info(f"✅ MCP execution successful")
-                
-            except Exception as e:
-                logger.error(f"❌ MCP execution failed: {e}")
-                root_span.record_exception(e)
-                
-                logger.info("↪️  Falling back to A2A path")
-                response_text, a2a_metadata = await handle_a2a_path(query, conversation_id)
-                path_taken = "a2a_fallback"
-                metadata.update(a2a_metadata)
-                metadata["mcp_error"] = str(e)
-        
-        elif chosen_path == "a2a":
-            # A2A MULTI AGENT PATH
-            logger.info(f"🔄 A2A Path: {decision['reasoning']}")
-            
-            if needs_expertise:
-                logger.info(f"   🧠 Domain expertise will be used")
-            
-            response_text, a2a_metadata = await handle_a2a_path(query, conversation_id)
-            path_taken = "a2a"
-            metadata.update(a2a_metadata)
-            metadata["domain_expertise_used"] = needs_expertise
-        
-        else:
-            # MCP selected but not available - fallback
-            logger.warning("MCP selected but unavailable - fallback to A2A")
-            response_text, a2a_metadata = await handle_a2a_path(query, conversation_id)
-            path_taken = "a2a_fallback"
-            metadata.update(a2a_metadata)
-            metadata["fallback_reason"] = "MCP unavailable"
-        
-        # Calculate latency
-        latency_ms = int((time.time() - start_time) * 1000)
-        
-        root_span.set_attribute("path_taken", path_taken)
-        root_span.set_attribute("latency_ms", latency_ms)
-        root_span.set_attribute("needs_expertise", needs_expertise)
-        
-        logger.info(f"✅ Response via {path_taken} in {latency_ms}ms")
-        logger.info("=" * 80)
-        
-        # Log to ClickHouse: Assistant response
-        if clickhouse_logger:
-            try:
-                clickhouse_logger.log_conversation(
-                    conversation_id=conversation_id,
-                    user_id=request.user_id,
-                    role="assistant",
-                    content=response_text[:1000],
-                    intent=intent,
-                    routed_to_orchestrator=(path_taken in ["a2a", "a2a_fallback"]),
-                    metadata={
-                        "path": path_taken,
-                        "latency_ms": latency_ms,
-                        "confidence": confidence,
-                        "needs_expertise": needs_expertise
-                    }
-                )
-            except Exception as e:
-                logger.warning(f"ClickHouse logging failed: {e}")
-        
-        return ChatResponse(
-            response=response_text,
-            path=path_taken,
-            latency_ms=latency_ms,
-            intent=intent,
-            confidence=confidence,
-            metadata=metadata
-        )
-
-
-# ============================================================================
-# MCP TOOL EXECUTION (DYNAMIC DISPATCH)
-# ============================================================================
-
-async def call_mcp_tool_dynamic(tool_name: str, parameters: Dict) -> Dict[str, Any]:
-    """Dynamically call any MCP tool"""
-    
-    with tracer.start_as_current_span("call_mcp_tool_dynamic") as span:
-        span.set_attribute("tool_name", tool_name)
-        span.set_attribute("parameters", json.dumps(parameters))
-        
-        tool_method_map = {
-            "mbta_get_alerts": mcp_client.get_alerts,
-            "mbta_get_routes": mcp_client.get_routes,
-            "mbta_get_stops": mcp_client.get_stops,
-            "mbta_search_stops": mcp_client.search_stops,
-            "mbta_get_predictions": mcp_client.get_predictions,
-            "mbta_get_predictions_for_stop": mcp_client.get_predictions_for_stop,
-            "mbta_get_schedules": mcp_client.get_schedules,
-            "mbta_get_trips": mcp_client.get_trips,
-            "mbta_get_vehicles": mcp_client.get_vehicles,
-            "mbta_get_nearby_stops": mcp_client.get_nearby_stops,
-            "mbta_plan_trip": mcp_client.plan_trip,
-            "mbta_list_all_routes": mcp_client.list_all_routes,
-            "mbta_list_all_stops": mcp_client.list_all_stops,
-            "mbta_list_all_alerts": mcp_client.list_all_alerts,
+            } else if (effect === 'cloudy') {
+                for (let i = 0; i < 5; i++) {
+                    particles.push(new Particle('cloud'));
+                }
+            }
         }
-        
-        if tool_name not in tool_method_map:
-            raise ValueError(f"Unknown MCP tool: {tool_name}")
-        
-        method = tool_method_map[tool_name]
-        
-        logger.info(f"🔧 Calling {tool_name} with params: {parameters}")
-        result = await method(**parameters)
-        span.set_attribute("success", True)
-        logger.info(f"✓ Tool execution successful")
-        
-        return result
 
+        function animateWeather() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-# ============================================================================
-# RESPONSE SYNTHESIS
-# ============================================================================
+            particles.forEach(particle => {
+                particle.update();
+                particle.draw();
+            });
 
-async def synthesize_mcp_response_with_llm(query: str, tool_name: str, tool_result: Dict) -> str:
-    """Convert MCP JSON response into natural language"""
+            requestAnimationFrame(animateWeather);
+        }
+
+        animateWeather();
+
+        // ============================================================
+        // FETCH REAL WEATHER
+        // ============================================================
+
+        async function fetchWeather() {
+            try {
+                const response = await fetch(`https://wttr.in/Boston?format=j1`);
+                const data = await response.json();
+                
+                const current = data.current_condition[0];
+                const weatherDesc = current.weatherDesc[0].value;
+                const temp = current.temp_F;
+                const feelsLike = current.FeelsLikeF;
+                
+                let condition = 'Clear';
+                if (weatherDesc.toLowerCase().includes('snow')) {
+                    condition = 'Snow';
+                } else if (weatherDesc.toLowerCase().includes('rain')) {
+                    condition = 'Rain';
+                } else if (weatherDesc.toLowerCase().includes('cloud')) {
+                    condition = 'Clouds';
+                } else if (weatherDesc.toLowerCase().includes('clear') || weatherDesc.toLowerCase().includes('sunny')) {
+                    condition = 'Clear';
+                }
+                
+                currentWeather = {
+                    condition: condition,
+                    description: weatherDesc,
+                    temp: temp,
+                    feelsLike: feelsLike,
+                    location: 'Boston, MA'
+                };
+                
+                updateWeatherDisplay();
+                setWeatherEffect(condition);
+                
+            } catch (error) {
+                console.error('Weather fetch failed:', error);
+                currentWeather = {
+                    condition: 'Clear',
+                    description: 'Unable to fetch weather',
+                    temp: '--',
+                    feelsLike: '--',
+                    location: 'Boston, MA'
+                };
+                updateWeatherDisplay();
+            }
+        }
+
+        function updateWeatherDisplay() {
+            if (!currentWeather) return;
+
+            const iconMap = {
+                'Clear': '☀️',
+                'Clouds': '☁️',
+                'Rain': '🌧️',
+                'Drizzle': '🌦️',
+                'Thunderstorm': '⛈️',
+                'Snow': '❄️',
+                'Mist': '🌫️',
+                'Fog': '🌫️',
+                'Haze': '🌫️'
+            };
+
+            const icon = iconMap[currentWeather.condition] || '☁️';
+            document.getElementById('weatherIcon').textContent = icon;
+
+            const weatherInfo = document.getElementById('weatherInfo');
+            weatherInfo.innerHTML = `
+                <div class="weather-info-title">${icon} ${currentWeather.description}</div>
+                <div class="weather-info-detail">
+                    ${currentWeather.location} • ${currentWeather.temp}°F (feels like ${currentWeather.feelsLike}°F)
+                </div>
+            `;
+        }
+
+        fetchWeather();
+        setInterval(fetchWeather, 600000); // 10 minutes
+
+        // ============================================================
+        // PROTOCOL SELECTION
+        // ============================================================
+
+        function selectProtocol(protocol) {
+            currentProtocol = protocol;
+            
+            document.querySelectorAll('.protocol-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`[data-protocol="${protocol}"]`).classList.add('active');
+            
+            const mode = protocol === 'auto' ? 'Intelligent Auto-Routing' : 
+                        protocol === 'mcp' ? 'MCP Fast Path (forced)' : 
+                        'A2A Multi-Agent (forced)';
+            
+            addSystemMessage(`Routing mode: ${mode}`);
+        }
+
+        // ============================================================
+        // WEBSOCKET CONNECTION
+        // ============================================================
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.hostname}:${window.location.port}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('statusDot').classList.add('connected');
+                document.getElementById('statusText').textContent = 'Connected';
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                console.log('Received:', data);
+
+                if (data.type === 'response') {
+                    addMessage('assistant', data.response);
+                    updateInternals(data.metadata);
+                } else if (data.type === 'error') {
+                    addMessage('system', `Error: ${data.message}`);
+                }
+
+                document.getElementById('sendButton').disabled = false;
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                document.getElementById('statusDot').classList.remove('connected');
+                document.getElementById('statusText').textContent = 'Error';
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('statusDot').classList.remove('connected');
+                document.getElementById('statusText').textContent = 'Disconnected';
+                
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+
+            if (!message || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            addMessage('user', message);
+
+            ws.send(JSON.stringify({
+                message: message,
+                force_protocol: currentProtocol
+            }));
+
+            input.value = '';
+            document.getElementById('sendButton').disabled = true;
+
+            updateInternals({
+                path: 'processing',
+                intent: 'analyzing...',
+                confidence: 0
+            });
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        function addMessage(role, content) {
+            const container = document.getElementById('messagesContainer');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.textContent = content;
+
+            messageDiv.appendChild(contentDiv);
+            container.appendChild(messageDiv);
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function addSystemMessage(content) {
+            addMessage('system', content);
+        }
+
+        function updateInternals(metadata) {
+            const internalsContent = document.getElementById('internalsContent');
+            
+            if (metadata.path === 'processing') {
+                internalsContent.innerHTML = `
+                    <div class="info-block">
+                        <div class="info-label">Status</div>
+                        <div class="info-value">⏳ Processing query...</div>
+                    </div>
+                `;
+                return;
+            }
+
+            const unified = metadata.unified_decision || {};
+            const path = metadata.path || unified.path || 'unknown';
+            const intent = unified.intent || 'unknown';
+            const confidence = unified.confidence || 0;
+            const latency = metadata.latency_ms || 0;
+            const reasoning = unified.reasoning || 'No reasoning provided';
+            const agents = metadata.agents_called || [];
+            const manualOverride = unified.manual_override || false;
+            const forceProtocol = unified.force_protocol || 'auto';
+
+            let badgeClass = 'mcp';
+            let badgeText = 'MCP';
+            if (path === 'a2a' || path === 'a2a_fallback') {
+                badgeClass = 'a2a';
+                badgeText = 'A2A';
+            } else if (path === 'shortcut') {
+                badgeClass = 'shortcut';
+                badgeText = 'SHORTCUT';
+            }
+
+            const latencyPercent = Math.min((latency / 3000) * 100, 100);
+
+            internalsContent.innerHTML = `
+                <div class="info-block">
+                    <div class="info-label">Routing Path</div>
+                    <div class="info-value">
+                        <span class="badge ${badgeClass}">${badgeText}</span>
+                        ${manualOverride ? '<span class="badge override">🔧 MANUAL OVERRIDE</span>' : ''}
+                    </div>
+                </div>
+
+                ${manualOverride ? `
+                <div class="info-block">
+                    <div class="info-label">Override Mode</div>
+                    <div class="info-value" style="color: #ffd93d;">
+                        User selected: ${forceProtocol.toUpperCase()}
+                    </div>
+                </div>
+                ` : ''}
+
+                <div class="info-block">
+                    <div class="info-label">Intent Classification</div>
+                    <div class="info-value">${intent} (${(confidence * 100).toFixed(0)}%)</div>
+                </div>
+
+                <div class="info-block">
+                    <div class="info-label">Response Time</div>
+                    <div class="info-value">${latency}ms</div>
+                    <div class="latency-bar">
+                        <div class="latency-fill" style="width: ${latencyPercent}%"></div>
+                    </div>
+                </div>
+
+                <div class="info-block">
+                    <div class="info-label">Routing Logic</div>
+                    <div class="info-value" style="font-size: 12px; line-height: 1.6;">${reasoning}</div>
+                </div>
+
+                ${agents.length > 0 ? `
+                <div class="info-block">
+                    <div class="info-label">Agents Called (${agents.length})</div>
+                    <ul class="agent-list">
+                        ${agents.map(agent => `<li class="agent-item">→ ${agent}</li>`).join('')}
+                    </ul>
+                </div>
+                ` : ''}
+            `;
+        }
+
+        // Initialize
+        connectWebSocket();
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
     
-    system_prompt = """You are a helpful MBTA transit assistant.
-
-Convert the technical API response into a natural, conversational answer.
-
-Be concise but informative. Use natural language, not technical jargon."""
-
-    tool_result_str = json.dumps(tool_result, indent=2)
-    if len(tool_result_str) > 4000:
-        tool_result_str = tool_result_str[:4000] + "\n... (truncated)"
-    
-    user_message = f"""User Query: "{query}"
-
-Tool Used: {tool_name}
-
-API Response:
-{tool_result_str}
-
-Convert to natural answer."""
-
     try:
-        with tracer.start_as_current_span("synthesize_response"):
-            response = await asyncio.to_thread(
-                openai_client.chat.completions.create,
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.7,
-                max_tokens=500
-            )
+        while True:
+            # Receive message from client
+            data = await websocket.receive_json()
+            message = data.get('message', '')
+            conversation_id = data.get('conversation_id')
+            force_protocol = data.get('force_protocol', 'auto')  # NEW: Get protocol override
             
-            return response.choices[0].message.content.strip()
-    
+            # Call Exchange Agent with protocol override
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.post(
+                        f"{EXCHANGE_AGENT_URL}/chat",
+                        json={
+                            'query': message,
+                            'conversation_id': conversation_id,
+                            'force_protocol': force_protocol  # NEW: Pass to backend
+                        },
+                        timeout=30.0
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    confidence_value = result.get('confidence', 0.0)
+                    logger.info(f"Query: '{message}' | Confidence: {confidence_value} | Intent: {result.get('intent')} | Path: {result.get('path')} | Override: {force_protocol}")
+
+                    # Send response back to client
+                    await manager.send_message({
+                        'type': 'response',
+                        'response': result['response'],
+                        'conversation_id': conversation_id,
+                        'metadata': result.get('metadata', {})
+                    }, websocket)
+                    
+                except httpx.HTTPError as e:
+                    logger.error(f"Error calling exchange agent: {e}")
+                    await manager.send_message({
+                        'type': 'error',
+                        'message': 'Failed to process message. Please try again.'
+                    }, websocket)
+                    
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
     except Exception as e:
-        logger.error(f"Synthesis failed: {e}")
-        return f"I found information but had trouble formatting it: {str(tool_result)[:200]}..."
-
-
-# ============================================================================
-# A2A PATH HANDLER
-# ============================================================================
-
-async def handle_a2a_path(query: str, conversation_id: str) -> tuple[str, Dict[str, Any]]:
-    """Handle query using A2A agents with domain expertise"""
-    
-    with tracer.start_as_current_span("handle_a2a_path") as span:
-        span.set_attribute("query", query)
-        span.set_attribute("conversation_id", conversation_id)
-        
-        if not stategraph_orchestrator:
-            logger.error("StateGraph unavailable")
-            return (
-                "I'm having trouble processing your request. Please try again.",
-                {"error": "StateGraph unavailable"}
-            )
-        
-        try:
-            logger.info(f"🔄 Running StateGraph orchestration")
-            
-            result = await stategraph_orchestrator.process_message(query, conversation_id)
-            
-            response_text = result.get("response", "")
-            
-            metadata = {
-                "stategraph_intent": result.get("intent"),
-                "stategraph_confidence": result.get("confidence"),
-                "agents_called": result.get("agents_called", []),
-                "graph_execution": result.get("metadata", {}).get("graph_execution", "completed")
-            }
-            
-            span.set_attribute("agents_called", json.dumps(metadata['agents_called']))
-            span.set_attribute("agents_count", len(metadata['agents_called']))
-            
-            logger.info(f"✓ StateGraph completed")
-            logger.info(f"   Agents: {', '.join(metadata['agents_called'])}")
-            
-            return response_text, metadata
-        
-        except Exception as e:
-            logger.error(f"A2A error: {e}", exc_info=True)
-            span.record_exception(e)
-            return (f"Error: {str(e)}", {"error": str(e)})
-
-
-# ============================================================================
-# HEALTH & METRICS
-# ============================================================================
+        logger.error(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
 
 @app.get("/health")
-async def health_check():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "components": {
-            "mcp_client": {
-                "available": mcp_client is not None,
-                "initialized": mcp_client._initialized if mcp_client else False,
-                "tools_count": len(mcp_client._available_tools) if mcp_client and hasattr(mcp_client, '_available_tools') else 0
-            },
-            "stategraph": {
-                "available": stategraph_orchestrator is not None
-            },
-            "clickhouse": {
-                "available": clickhouse_logger is not None
-            },
-            "routing": {
-                "method": "expertise_based",
-                "version": "4.0"
-            }
-        }
-    }
-
-
-@app.get("/metrics")
-async def get_metrics():
-    """Metrics endpoint"""
-    tools_available = []
-    if mcp_client and hasattr(mcp_client, '_available_tools'):
-        tools_available = [tool.name for tool in mcp_client._available_tools]
-    
-    return {
-        "mcp_tools_available": len(tools_available),
-        "mcp_tools": tools_available,
-        "stategraph_available": stategraph_orchestrator is not None,
-        "version": "4.0.0",
-        "routing_method": "expertise_based",
-        "routing_criteria": {
-            "mcp": "Simple fact lookups (API wrappers sufficient)",
-            "a2a": "Queries needing domain expertise (predictions, recommendations, analysis)"
-        },
-        "expertise_detection": {
-            "predictive": ["should i wait", "how long will", "when will"],
-            "decision_support": ["should i", "recommend", "suggest", "better to"],
-            "conditional": ["if", "considering", "depending on"],
-            "analytical": ["why", "explain", "what caused", "how serious"],
-            "multi_step": ["from X to Y", "route considering", "check then"]
-        },
-        "llm_calls_per_request": {
-            "shortcut_path": 0,
-            "mcp_path": 2,  # 1 unified + 1 synthesis
-            "a2a_path": 1,  # 1 unified only
-        }
-    }
-
+async def health():
+    return {"status": "healthy", "service": "frontend"}
 
 if __name__ == "__main__":
     import uvicorn
-    
-    logger.info("=" * 80)
-    logger.info("🚀 Starting MBTA Exchange Agent Server")
-    logger.info("   Version: 4.0.0")
-    logger.info("   Routing: Intelligent Expertise-Based")
-    logger.info("   Logic: Routes based on domain expertise needs")
-    logger.info("=" * 80)
-    
-    uvicorn.run(app, host="0.0.0.0", port=8100)
+    uvicorn.run(app, host="0.0.0.0", port=3000)
